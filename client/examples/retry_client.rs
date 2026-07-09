@@ -9,7 +9,6 @@
 //
 
 extern crate bitcoincore_rpc;
-extern crate jsonrpc;
 extern crate serde;
 extern crate serde_json;
 
@@ -31,9 +30,9 @@ impl RpcApi for RetryClient {
         for _ in 0..RETRY_ATTEMPTS {
             match self.client.call(cmd, args) {
                 Ok(ret) => return Ok(ret),
-                Err(Error::JsonRpc(jsonrpc::error::Error::Rpc(ref rpcerr)))
-                    if rpcerr.code == -28 =>
-                {
+                // Retry on transient MCP transport errors (e.g. the server or
+                // node is still warming up and the request timed out).
+                Err(Error::Mcp(_)) => {
                     ::std::thread::sleep(::std::time::Duration::from_millis(INTERVAL));
                     continue;
                 }

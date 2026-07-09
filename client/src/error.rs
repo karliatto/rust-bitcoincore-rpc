@@ -31,6 +31,8 @@ pub enum Error {
     UnexpectedStructure,
     /// The daemon returned an error string.
     ReturnedError(String),
+    /// An error occurred in the MCP-over-Nostr transport or service.
+    Mcp(String),
 }
 
 impl From<jsonrpc::error::Error> for Error {
@@ -88,6 +90,7 @@ impl fmt::Display for Error {
             Error::InvalidCookieFile => write!(f, "invalid cookie file"),
             Error::UnexpectedStructure => write!(f, "the JSON result had an unexpected structure"),
             Error::ReturnedError(ref s) => write!(f, "the daemon returned an error string: {}", s),
+            Error::Mcp(ref s) => write!(f, "MCP transport error: {}", s),
         }
     }
 }

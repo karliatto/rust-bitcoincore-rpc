@@ -18,9 +18,15 @@ use std::{fmt, result};
 use crate::bitcoin;
 use crate::bitcoin::consensus::encode;
 use bitcoin::hex::DisplayHex;
-use jsonrpc;
 use serde;
 use serde_json;
+
+use contextvm_sdk::rmcp::model::{CallToolRequestParams, RawContent};
+use contextvm_sdk::rmcp::service::{RoleClient, RunningService};
+use contextvm_sdk::rmcp::ServiceExt;
+use contextvm_sdk::signer;
+use contextvm_sdk::transport::client::{NostrClientTransport, NostrClientTransportConfig};
+use tokio::runtime::Runtime;
 
 use crate::bitcoin::address::{NetworkUnchecked, NetworkChecked};
 use crate::bitcoin::hashes::hex::FromHex;
@@ -28,7 +34,7 @@ use crate::bitcoin::secp256k1::ecdsa::Signature;
 use crate::bitcoin::{
     Address, Amount, Block, OutPoint, PrivateKey, PublicKey, Script, Transaction,
 };
-use log::Level::{Debug, Trace, Warn};
+use log::Level::Debug;
 
 use crate::error::*;
 use crate::json;
@@ -355,7 +361,7 @@ pub trait RpcApi: Sized {
         &self,
         hash: &bitcoin::BlockHash,
     ) -> Result<json::GetBlockHeaderResult> {
-        self.call("getblockheader", &[into_json(hash)?, true.into()])
+        self.call("getblockheaderinfo", &[into_json(hash)?, true.into()])
     }
 
     fn get_mining_info(&self) -> Result<json::GetMiningInfoResult> {
@@ -1269,83 +1275,289 @@ pub trait RpcApi: Sized {
     }
 }
 
-/// Client implements a JSON-RPC client for the Bitcoin Core daemon or compatible APIs.
+/// MCP client handler used for the Nostr transport. It uses the default
+/// [`ClientHandler`](contextvm_sdk::rmcp::ClientHandler) behaviour.
+#[derive(Clone, Default)]
+struct BitcoinRpcNostrClient;
+
+impl contextvm_sdk::rmcp::ClientHandler for BitcoinRpcNostrClient {}
+
+/// Client implements a Bitcoin Core RPC client that talks to a ContextVM
+/// MCP server over the Nostr network.
+///
+/// The synchronous [`RpcApi`] surface is preserved: each call is translated
+/// into an MCP `tools/call` request and executed by blocking on an internal
+/// Tokio runtime. Because of this, methods on this client must not be invoked
+/// from within an existing async runtime, or the internal `block_on` will
+/// panic.
 pub struct Client {
-    client: jsonrpc::client::Client,
+    runtime: Runtime,
+    service: RunningService<RoleClient, BitcoinRpcNostrClient>,
+    server_pubkey: String,
 }
 
 impl fmt::Debug for Client {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "bitcoincore_rpc::Client({:?})", self.client)
+        write!(f, "bitcoincore_rpc::Client(server_pubkey={})", self.server_pubkey)
     }
 }
 
 impl Client {
-    /// Creates a client to a bitcoind JSON-RPC server.
+    /// Creates a client connected to a ContextVM MCP server over Nostr.
     ///
-    /// Can only return [Err] when using cookie authentication.
-    pub fn new(url: &str, auth: Auth) -> Result<Self> {
-        let (user, pass) = auth.get_user_pass()?;
-        jsonrpc::client::Client::simple_http(url, user, pass)
-            .map(|client| Client {
-                client,
-            })
-            .map_err(|e| super::error::Error::JsonRpc(e.into()))
+    /// A fresh random signer is generated for this client. The client connects
+    /// to the given `relay_urls` and targets the server identified by
+    /// `server_pubkey` (hex, npub, or nprofile).
+    pub fn new(relay_urls: Vec<String>, server_pubkey: String) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(Error::from)?;
+
+        let pubkey = server_pubkey.clone();
+        let service = runtime.block_on(async move {
+            let signer = signer::generate();
+            let transport = NostrClientTransport::new(
+                signer,
+                NostrClientTransportConfig::default()
+                    .with_relay_urls(relay_urls)
+                    .with_server_pubkey(pubkey),
+            )
+            .await
+            .map_err(|e| Error::Mcp(e.to_string()))?;
+
+            BitcoinRpcNostrClient.serve(transport).await.map_err(|e| Error::Mcp(e.to_string()))
+        })?;
+
+        Ok(Client {
+            runtime,
+            service,
+            server_pubkey,
+        })
     }
 
-    /// Create a new Client using the given [jsonrpc::Client].
-    pub fn from_jsonrpc(client: jsonrpc::client::Client) -> Client {
-        Client {
-            client,
+    /// Returns the list of tool names advertised by the connected MCP server.
+    ///
+    /// This is a debugging aid to verify that the tool names and schemas match
+    /// the mapping used by this client (see [`rpc_to_tool`]).
+    pub fn list_tool_names(&self) -> Result<Vec<String>> {
+        let tools = self
+            .runtime
+            .block_on(self.service.list_all_tools())
+            .map_err(|e| Error::Mcp(e.to_string()))?;
+        Ok(tools.into_iter().map(|t| t.name.to_string()).collect())
+    }
+
+    /// Debugging aid: prints every tool advertised by the connected MCP server
+    /// together with its description and input schema (parameter names/types).
+    ///
+    /// Use this to verify that the server's actual tool names and parameters
+    /// match the mapping used by this client (see [`rpc_to_tool`]).
+    pub fn dump_tool_schemas(&self) -> Result<()> {
+        let tools = self
+            .runtime
+            .block_on(self.service.list_all_tools())
+            .map_err(|e| Error::Mcp(e.to_string()))?;
+        println!("MCP server advertises {} tool(s):", tools.len());
+        for tool in &tools {
+            let schema = serde_json::to_string_pretty(&*tool.input_schema)
+                .unwrap_or_else(|_| "<unserializable schema>".to_string());
+            println!("- {}", tool.name);
+            if let Some(desc) = &tool.description {
+                println!("  description: {}", desc);
+            }
+            println!("  input_schema: {}", schema);
         }
-    }
-
-    /// Get the underlying JSONRPC client.
-    pub fn get_jsonrpc_client(&self) -> &jsonrpc::client::Client {
-        &self.client
+        Ok(())
     }
 }
 
 impl RpcApi for Client {
-    /// Call an `cmd` rpc with given `args` list
+    /// Call an `cmd` rpc with given `args` list.
+    ///
+    /// The JSON-RPC `cmd` name and its positional `args` are translated into an
+    /// MCP `tools/call` request: the tool name matches the `cmd` name and the
+    /// positional arguments are zipped with the tool's named parameters.
     fn call<T: for<'a> serde::de::Deserialize<'a>>(
         &self,
         cmd: &str,
         args: &[serde_json::Value],
     ) -> Result<T> {
-        let raw = serde_json::value::to_raw_value(args)?;
-        let req = self.client.build_request(&cmd, Some(&*raw));
-        if log_enabled!(Debug) {
-            debug!(target: "bitcoincore_rpc", "JSON-RPC request: {} {}", cmd, serde_json::Value::from(args));
+        let tool = cmd;
+        let params = rpc_params(cmd)
+            .ok_or_else(|| Error::ReturnedError(format!("unknown RPC command: {}", cmd)))?;
+
+        // Zip positional args with the tool's named parameters, skipping any
+        // trailing/interior `null`s so the server applies its own defaults.
+        let mut arguments = serde_json::Map::new();
+        for (name, value) in params.iter().zip(args.iter()) {
+            if !value.is_null() {
+                arguments.insert((*name).to_string(), value.clone());
+            }
         }
 
-        let resp = self.client.send_request(req).map_err(Error::from);
-        log_response(cmd, &resp);
-        Ok(resp?.result()?)
+        if log_enabled!(Debug) {
+            debug!(target: "bitcoincore_rpc", "MCP tools/call: {} {}", tool, serde_json::Value::Object(arguments.clone()));
+        }
+
+        let mut request = CallToolRequestParams::new(tool.to_string());
+        if !arguments.is_empty() {
+            request = request.with_arguments(arguments);
+        }
+
+        let result = self
+            .runtime
+            .block_on(self.service.call_tool(request))
+            .map_err(|e| Error::Mcp(e.to_string()))?;
+
+        // Extract the first textual content block as the JSON-encoded result.
+        let text = result
+            .content
+            .iter()
+            .find_map(|c| match &c.raw {
+                RawContent::Text(t) => Some(t.text.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "null".to_string());
+
+        if log_enabled!(Debug) {
+            debug!(target: "bitcoincore_rpc", "MCP tools/call result for {}: is_error={:?} text={}", tool, result.is_error, text);
+        }
+
+        if result.is_error == Some(true) {
+            return Err(Error::ReturnedError(text));
+        }
+
+        let value: serde_json::Value = serde_json::from_str(&text)?;
+        Ok(serde_json::from_value(value)?)
     }
 }
 
-fn log_response(cmd: &str, resp: &Result<jsonrpc::Response>) {
-    if log_enabled!(Warn) || log_enabled!(Debug) || log_enabled!(Trace) {
-        match resp {
-            Err(ref e) => {
-                if log_enabled!(Debug) {
-                    debug!(target: "bitcoincore_rpc", "JSON-RPC failed parsing reply of {}: {:?}", cmd, e);
-                }
-            }
-            Ok(ref resp) => {
-                if let Some(ref e) = resp.error {
-                    if log_enabled!(Debug) {
-                        debug!(target: "bitcoincore_rpc", "JSON-RPC error for {}: {:?}", cmd, e);
-                    }
-                } else if log_enabled!(Trace) {
-                    let def = serde_json::value::to_raw_value(&serde_json::value::Value::Null).unwrap();
-                    let result = resp.result.as_ref().unwrap_or(&def);
-                    trace!(target: "bitcoincore_rpc", "JSON-RPC response for {}: {}", cmd, result);
-                }
-            }
+/// Return the ordered list of named parameters for a Bitcoin Core JSON-RPC
+/// command.
+///
+/// The MCP tool name matches the JSON-RPC `cmd` name, so no name translation is
+/// needed. The parameter names follow Bitcoin Core's canonical argument names,
+/// and their order matches the order in which the corresponding `RpcApi` method
+/// pushes positional arguments into `call`.
+fn rpc_params(cmd: &str) -> Option<&'static [&'static str]> {
+    let params: &'static [&'static str] = match cmd {
+        "getnetworkinfo" => &[],
+        "getindexinfo" => &[],
+        "addmultisigaddress" => &["nrequired", "keys", "label", "address_type"],
+        "loadwallet" => &["filename"],
+        "unloadwallet" => &["wallet_name"],
+        "createwallet" => {
+            &["wallet_name", "disable_private_keys", "blank", "passphrase", "avoid_reuse"]
         }
-    }
+        "listwallets" => &[],
+        "listwalletdir" => &[],
+        "getwalletinfo" => &[],
+        "backupwallet" => &["destination"],
+        "dumpprivkey" => &["address"],
+        "encryptwallet" => &["passphrase"],
+        "getdifficulty" => &[],
+        "getconnectioncount" => &[],
+        "getblock" => &["blockhash", "verbosity"],
+        "getblockheader" => &["blockhash", "verbose"],
+        "getblockheaderinfo" => &["blockhash", "verbose"],
+        "getmininginfo" => &[],
+        "getblocktemplate" => &["template_request"],
+        "getblockchaininfo" => &[],
+        "getblockcount" => &[],
+        "getbestblockhash" => &[],
+        "getblockhash" => &["height"],
+        "getblockstats" => &["hash_or_height", "stats"],
+        "getrawtransaction" => &["txid", "verbose", "blockhash"],
+        "getblockfilter" => &["blockhash", "filtertype"],
+        "getbalance" => &["dummy", "minconf", "include_watchonly"],
+        "getbalances" => &[],
+        "getreceivedbyaddress" => &["address", "minconf"],
+        "gettransaction" => &["txid", "include_watchonly"],
+        "listtransactions" => &["label", "count", "skip", "include_watchonly"],
+        "listsinceblock" => {
+            &["blockhash", "target_confirmations", "include_watchonly", "include_removed"]
+        }
+        "gettxout" => &["txid", "n", "include_mempool"],
+        "gettxoutproof" => &["txids", "blockhash"],
+        "importpubkey" => &["pubkey", "label", "rescan"],
+        "importprivkey" => &["privkey", "label", "rescan"],
+        "importaddress" => &["address", "label", "rescan", "p2sh"],
+        "importmulti" => &["requests", "options"],
+        "importdescriptors" => &["requests"],
+        "setlabel" => &["address", "label"],
+        "keypoolrefill" => &["newsize"],
+        "listunspent" => &["minconf", "maxconf", "addresses", "include_unsafe", "query_options"],
+        "lockunspent" => &["unlock", "transactions"],
+        "listreceivedbyaddress" => {
+            &["minconf", "include_empty", "include_watchonly", "address_filter"]
+        }
+        "createpsbt" => &["inputs", "outputs", "locktime", "replaceable"],
+        "createrawtransaction" => &["inputs", "outputs", "locktime", "replaceable"],
+        "decoderawtransaction" => &["hexstring", "iswitness"],
+        "fundrawtransaction" => &["hexstring", "options", "iswitness"],
+        "signrawtransaction" => &["hexstring", "prevtxs", "privkeys", "sighashtype"],
+        "signrawtransactionwithwallet" => &["hexstring", "prevtxs", "sighashtype"],
+        "signrawtransactionwithkey" => &["hexstring", "privkeys", "prevtxs", "sighashtype"],
+        "testmempoolaccept" => &["rawtxs", "maxfeerate"],
+        "stop" => &[],
+        "verifymessage" => &["address", "signature", "message"],
+        "getnewaddress" => &["label", "address_type"],
+        "getrawchangeaddress" => &["address_type"],
+        "getaddressinfo" => &["address"],
+        "generatetoaddress" => &["nblocks", "address", "maxtries"],
+        "generate" => &["nblocks", "maxtries"],
+        "invalidateblock" => &["blockhash"],
+        "reconsiderblock" => &["blockhash"],
+        "getmempoolinfo" => &[],
+        "getrawmempool" => &["verbose"],
+        "getmempoolentry" => &["txid"],
+        "getchaintips" => &[],
+        "sendtoaddress" => &[
+            "address",
+            "amount",
+            "comment",
+            "comment_to",
+            "subtractfeefromamount",
+            "replaceable",
+            "conf_target",
+            "estimate_mode",
+        ],
+        "addnode" => &["node", "command"],
+        "disconnectnode" => &["address", "nodeid"],
+        "getaddednodeinfo" => &["node"],
+        "getnodeaddresses" => &["count"],
+        "listbanned" => &[],
+        "clearbanned" => &[],
+        "setban" => &["subnet", "command", "bantime", "absolute"],
+        "setnetworkactive" => &["state"],
+        "getpeerinfo" => &[],
+        "ping" => &[],
+        "sendrawtransaction" => &["hexstring", "maxfeerate"],
+        "estimatesmartfee" => &["conf_target", "estimate_mode"],
+        "waitfornewblock" => &["timeout"],
+        "waitforblock" => &["blockhash", "timeout"],
+        "walletcreatefundedpsbt" => {
+            &["inputs", "outputs", "locktime", "options", "bip32derivs"]
+        }
+        "walletprocesspsbt" => &["psbt", "sign", "sighashtype", "bip32derivs"],
+        "getdescriptorinfo" => &["descriptor"],
+        "joinpsbts" => &["txs"],
+        "combinepsbt" => &["txs"],
+        "combinerawtransaction" => &["txs"],
+        "finalizepsbt" => &["psbt", "extract"],
+        "deriveaddresses" => &["descriptor", "range"],
+        "rescanblockchain" => &["start_height", "stop_height"],
+        "gettxoutsetinfo" => &["hash_type", "hash_or_height", "use_index"],
+        "getnettotals" => &[],
+        "getnetworkhashps" => &["nblocks", "height"],
+        "uptime" => &[],
+        "submitblock" => &["hexdata", "dummy"],
+        "scantxoutset" => &["action", "scanobjects"],
+        "getzmqnotifications" => &[],
+        _ => return None,
+    };
+    Some(params)
 }
 
 #[cfg(test)]

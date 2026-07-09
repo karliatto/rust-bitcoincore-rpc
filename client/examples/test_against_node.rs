@@ -9,21 +9,23 @@
 //
 
 //! A very simple example used as a self-test of this library against a Bitcoin
-//! Core node.
+//! Core node exposed via a ContextVM MCP-over-Nostr server.
 extern crate bitcoincore_rpc;
 
-use bitcoincore_rpc::{bitcoin, Auth, Client, Error, RpcApi};
+use bitcoincore_rpc::{bitcoin, Client, Error, RpcApi};
 
 fn main_result() -> Result<(), Error> {
     let mut args = std::env::args();
 
     let _exe_name = args.next().unwrap();
 
-    let url = args.next().expect("Usage: <rpc_url> <username> <password>");
-    let user = args.next().expect("no user given");
-    let pass = args.next().expect("no pass given");
+    let server_pubkey = args.next().expect("Usage: <server_pubkey> [relay_url]");
+    let relay_url = args.next().unwrap_or_else(|| "ws://localhost:10547".to_string());
 
-    let rpc = Client::new(&url, Auth::UserPass(user, pass)).unwrap();
+    let rpc = Client::new(vec![relay_url], server_pubkey).unwrap();
+
+    // Diagnostic: dump the server's advertised tools and their input schemas.
+    rpc.dump_tool_schemas()?;
 
     let _blockchain_info = rpc.get_blockchain_info()?;
 
