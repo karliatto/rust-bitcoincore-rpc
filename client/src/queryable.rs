@@ -41,11 +41,3 @@ impl<C: RpcApi> Queryable<C> for bitcoin::transaction::Transaction {
         Ok(bitcoin::consensus::encode::deserialize_hex(&hex)?)
     }
 }
-
-impl<C: RpcApi> Queryable<C> for Option<crate::json::GetTxOutResult> {
-    type Id = bitcoin::OutPoint;
-
-    fn query(rpc: &C, id: &Self::Id) -> Result<Self> {
-        rpc.get_tx_out(&id.txid, id.vout, Some(true))
-    }
-}

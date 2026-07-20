@@ -26,7 +26,6 @@ pub enum Error {
     Secp256k1(secp256k1::Error),
     Io(io::Error),
     InvalidAmount(bitcoin::amount::ParseAmountError),
-    InvalidCookieFile,
     /// The JSON result had an unexpected structure.
     UnexpectedStructure,
     /// The daemon returned an error string.
@@ -87,7 +86,6 @@ impl fmt::Display for Error {
             Error::Secp256k1(ref e) => write!(f, "secp256k1 error: {}", e),
             Error::Io(ref e) => write!(f, "I/O error: {}", e),
             Error::InvalidAmount(ref e) => write!(f, "invalid amount: {}", e),
-            Error::InvalidCookieFile => write!(f, "invalid cookie file"),
             Error::UnexpectedStructure => write!(f, "the JSON result had an unexpected structure"),
             Error::ReturnedError(ref s) => write!(f, "the daemon returned an error string: {}", s),
             Error::Mcp(ref s) => write!(f, "MCP transport error: {}", s),

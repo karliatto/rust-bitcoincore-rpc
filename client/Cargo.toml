@@ -26,6 +26,8 @@ rand = ["bitcoincore-rpc-json/rand"]
 bitcoincore-rpc-json = { version = "0.19.0", path = "../json" }
 
 log = "0.4.5"
+# Required for API compatibility with downstream crates (e.g. bdk_bitcoind_rpc)
+# that match on `Error::JsonRpc` and reference `bitcoincore_rpc::jsonrpc`.
 jsonrpc = { version = "0.18.0", features = ["minreq_http"] }
 
 # MCP-over-Nostr transport (ContextVM). The default feature re-exports `rmcp`,
@@ -36,9 +38,6 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 # Used for deserialization of JSON.
 serde = "1"
 serde_json = "1"
-
-[dev-dependencies]
-tempfile = "3.3.0"
 
 [[example]]
 name = "retry_client"
